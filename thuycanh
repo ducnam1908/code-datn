@@ -1,0 +1,347 @@
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include "thingspeak_diy.h"
+#include "sensor.h"
+
+/**********************************************************************************************************************/
+#include <Arduino_JSON.h>
+#include "BluetoothSerial.h"
+#include <nvs_flash.h>
+#include <Preferences.h>
+#include <HardwareSerial.h>
+#include <String.h>
+
+const char* Wifiname ;
+const char* password ;
+int status_wifi = 0;
+BluetoothSerial SerialBT;
+Preferences preferences;
+/* create a webserver in port 80 - defauld port of esp32 webserver */
+WiFiServer webServer(80);
+char str[100];
+int i = 0;
+/* timeout of connecting wifi  */
+unsigned long timeout =0;
+unsigned long timeout1 =0;
+
+#define BUTTON 0    /* Boot button is button 0 */
+int numPress = 0;
+bool isPress = false;
+void IRAM_ATTR isr()
+{
+  numPress += 1;
+  isPress = true;
+}
+void initBT()
+{
+  
+  if(!SerialBT.begin("Smart Farm 2"))
+  {
+    Serial.println("An error occurred initializing Bluetooth");
+    ESP.restart();
+  }
+  else
+  {
+    Serial.println("Bluetooth initialized");
+  }
+
+  SerialBT.register_callback(btCallback);
+  Serial.println("The device started, now you can pair it with bluetooth");
+}
+void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
+{
+  if(event == ESP_SPP_SRV_OPEN_EVT)
+  {
+    Serial.println("Client Connected!");
+  }
+  else if(event == ESP_SPP_DATA_IND_EVT)
+  {
+    String received = bluetoothReadLine();
+    Serial.println(received);
+    char* str = &received[0];
+    Wifiname = strtok(str,",");
+    Serial.println(Wifiname);
+    while(Wifiname != NULL)
+    {
+      password = strtok(NULL, ",");
+      WiFi.begin(Wifiname, password);
+      timeout = millis();
+      while (WiFi.status() != WL_CONNECTED) 
+      {
+          delay(500);
+          if(millis() - timeout >= 10000)
+          {
+            break;
+          }
+      }
+      if (WiFi.status() != WL_CONNECTED)
+      {
+          writeSerialBT("0");   /* Xử lý hiển thị trên giao diện (User Resend)*/
+          delay(2000);
+          break;
+      }
+      else
+      {
+        preferences.putString("Wifiname", Wifiname); 
+        preferences.putString("password", password);
+        preferences.end();
+
+        String ip = ip2Str(WiFi.localIP())+"/";
+        delay(2000);
+        writeSerialBT(ip);  /* Xử lý hiển thị trên giao diện Done*/
+
+        webServer.begin();
+        Thingspeak_Begin();
+        Serial.print("Connect to WiFi done!!");
+        status_wifi = 1;
+        break;
+      }
+    }
+  }
+}
+String bluetoothReadLine()
+{
+    String text_received = "";
+    while(SerialBT.available())
+    {
+        byte r = SerialBT.read();
+        if(r!=13 && r!=10 && char(r)!='\0')
+            text_received = text_received + char(r);
+    }
+    return text_received;      
+}
+void writeSerialBT(String respuesta)
+{
+  SerialBT.println(respuesta);
+  SerialBT.flush();
+}
+String ip2Str(IPAddress ip)
+{
+  String s="";
+  for (int i=0; i<4; i++) {
+    s += i  ? "." + String(ip[i]) : String(ip[i]);
+  }
+  return s;
+}
+/**********************************************************************************************************************/
+
+/* Require math problem
+ * NOMAL PH range: 6 - 8.5
+ *       Temperature: 28 - 32
+ *       Humid 68 - 72
+ */
+float ph_val = 0;
+float ph_voltage = 0;
+float as_val = 0;
+float as_voltage = 0;
+float humid = 0;
+float temper = 0;
+int cnt_thingspeak = 0;
+int delay_alarm = 0;
+int cnt_enable_alarm = 0;
+LiquidCrystal_I2C lcd(0x27, 16, 02);  
+
+unsigned long myChannelNumber = 2178095;                         /* Thingspeak channel ID */
+const char * myWriteAPIKey = "3B5YDE0GWDNIEOVV";                 /* Thingspeak API write key */
+
+void setup() 
+{
+  Serial.begin(9600);
+  lcd.init();
+  lcd.backlight();
+  Sensor_Init();
+
+/**********************************************************************************************************************/
+  isPress = false;
+  pinMode(BUTTON, INPUT_PULLUP);
+  attachInterrupt(BUTTON, isr, FALLING);
+  preferences.begin("my_space", false);
+  String flash_wifiname = preferences.getString("Wifiname", ""); 
+  String flash_password = preferences.getString("password", "");
+  if (flash_wifiname == "" || flash_password == "")
+  {
+    initBT();
+  }
+  else
+  {
+    WiFi.begin(flash_wifiname.c_str(), flash_password.c_str());
+    Serial.print("Connecting to WiFi ..");
+    timeout1 = millis();
+    while (WiFi.status() != WL_CONNECTED) 
+    {
+      if(millis() - timeout1 >= 10000)
+      {
+        Serial.println("error to connect to wifi");
+        nvs_flash_erase(); // erase the NVS partition and...
+        nvs_flash_init(); // initialize the NVS partition.
+        initBT();
+        break;
+      }
+    }
+    Serial.println(WiFi.localIP());
+    webServer.begin();
+    Thingspeak_Begin();
+    Serial.print("Connect to WiFi done!!");
+    status_wifi = 1;
+  }
+/**********************************************************************************************************************/
+}
+void loop() 
+{
+  lcd.clear(); 
+  Sensor_Read(&humid, &temper, &ph_val, &as_val);
+  Sensor_Exchange_Voltage(&ph_val, &as_val, &ph_voltage, &as_voltage);
+  if(delay_alarm == 0)
+  {
+    Check_Value_And_Alarm(humid, temper, ph_val);
+  }
+
+  /* LCD display */
+  lcd.setCursor(0, 0);
+  lcd.print("Hum: ");
+  lcd.print(humid, 0);
+  lcd.setCursor(0,1);
+  lcd.print("Tem: ");
+  lcd.print(temper, 0);
+  lcd.setCursor(9,0);
+  lcd.print("PH:");
+  lcd.print(ph_voltage, 1);
+  lcd.setCursor(9,1);
+  lcd.print("AS:");
+  lcd.print(as_val, 0);
+//  lcd.print(as_voltage, 1);
+
+/**********************************************************************************************************************/
+  if(isPress)
+  {
+    isPress = false;
+    delay(50);
+    nvs_flash_erase(); // erase the NVS partition and...
+    nvs_flash_init(); // initialize the NVS partition.
+    ESP.restart();
+  }
+  
+  /* New webClient connecting ... to webServer */
+  WiFiClient webClient = webServer.available();
+  if(webClient)
+  {
+    Serial.print("New client: ");
+    Serial.println(webClient.remoteIP());
+    String currentLine = "";
+    /* Nếu có client connect và không quá thời gian time out */
+    while(webClient.connected())
+    {
+      if(webClient.available())
+      {
+        char c = webClient.read();
+        if(c == '\n')
+        {
+          if (currentLine.length() == 0)
+          {
+            i = 0;
+            break;
+          }
+          else
+          {
+            if (i == 0)
+            {
+              /* String: GET/IR_type/btn_name */
+              char* buf = &currentLine[0];
+              char *token = strtok(buf,"/");    // GET
+              char *token1 = strtok(NULL,"/");  // IR_type
+              Serial.println(token);
+              Serial.println(token1);
+              if(strstr(token1,"remove") != NULL)
+              {
+                Serial.println("remove");
+                nvs_flash_erase(); // erase the NVS partition and...
+                nvs_flash_init(); // initialize the NVS partition.
+                delay(1000);
+                ESP.restart();
+              }
+              else
+              {
+                webClient.println("HTTP/1.1 200 OK");
+                webClient.println("Content-type:text/html"); // sau đó là kiểu nội dụng mà client gửi tới, ví dụ này là html
+              
+                /* Send data */
+                if(strstr(token1,"0") != NULL)
+                {
+                  webClient.println(""); //  Comillas importantes.
+                  webClient.println(temper);
+                }
+                else if(strstr(token1,"1") != NULL)
+                {
+                  webClient.println(""); 
+                  webClient.println(as_val);
+                }
+                else if(strstr(token1,"2") != NULL)
+                {
+                  webClient.println("");
+                  webClient.println(humid);
+                }
+                else if(strstr(token1,"3") != NULL)
+                {
+                  webClient.println(""); 
+                  webClient.println(ph_voltage);
+                }
+                else if(strstr(token1,"on") != NULL)
+                {
+                  webClient.println("Connection: close");      // kiểu kết nối ở đây là close. Nghĩa là không giữ kết nối sau khi nhận bản tin
+                  webClient.println();
+                  Serial.println("nut on ne");
+                  digitalWrite(APP_LAMP2, HIGH);
+                  // digitalWrite(LIGH_TEMP, HIGH);
+                }
+                else if(strstr(token1,"off") != NULL)
+                {
+                  webClient.println("Connection: close");      // kiểu kết nối ở đây là close. Nghĩa là không giữ kết nối sau khi nhận bản tin
+                  webClient.println();
+                  Serial.println("nut off ne");
+                  digitalWrite(APP_LAMP2, LOW);
+                  // digitalWrite(LIGH_TEMP, LOW);
+                }
+                else  /* Receive data */
+                {
+                  webClient.println("Connection: close");      // kiểu kết nối ở đây là close. Nghĩa là không giữ kết nối sau khi nhận bản tin
+                  webClient.println();
+                  delay_alarm = 1;
+                  cnt_enable_alarm = 0;
+                  Control_Device(token1);
+                }
+              }
+            }
+            currentLine = "";
+            i ++;
+          }
+        }
+        else if (c != '\r')
+        {
+          currentLine += c;
+        }
+      }
+    }
+    webClient.flush();
+    webClient.stop();
+  }
+
+/**********************************************************************************************************************/
+  if(delay_alarm = 1)
+  {
+    cnt_enable_alarm ++;
+    if(cnt_enable_alarm >= 20)  /* Delay Alarm 20sec */
+    {
+      /* enable alarm again */
+      delay_alarm = 0;
+      cnt_enable_alarm = 0;
+    }
+  }
+  /* Update to Thingspeak channel every 30 seconds */
+  cnt_thingspeak ++;
+  if(cnt_thingspeak >= 30 && status_wifi == 1)
+  {
+    updateThingSpeak(humid, temper, ph_voltage, as_val, myChannelNumber, myWriteAPIKey);
+    cnt_thingspeak = 0;
+  }
+  delay(1000);
+}
